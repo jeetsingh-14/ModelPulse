@@ -1,0 +1,40 @@
+version: '3'
+
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/modelpulse
+    depends_on:
+      - db
+    volumes:
+      - ./app:/app/app
+      - ./start.sh:/app/start.sh
+      - ./migrations:/app/migrations
+    # Using the start.sh script defined in the Dockerfile
+
+  db:
+    image: postgres:13
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=modelpulse
+    ports:
+      - "5432:5432"
+
+  simulator:
+    build: .
+    depends_on:
+      - api
+    environment:
+      - API_URL=http://api:8000/log
+    command: python simulator.py
+    volumes:
+      - ./simulator.py:/app/simulator.py
+
+volumes:
+  postgres_data:
