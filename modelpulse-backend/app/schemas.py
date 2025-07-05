@@ -3,7 +3,104 @@ from typing import List, Optional, Literal, Dict, Any, Union
 from datetime import datetime
 from enum import Enum
 
-from .models import UserRole
+from .models import UserRole, DriftSeverity
+
+
+# Organization Schemas
+class OrganizationBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    subscription_plan: str = "Basic"
+    billing_email: Optional[str] = None
+    is_active: bool = True
+
+
+class OrganizationCreate(OrganizationBase):
+    pass
+
+
+class OrganizationUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    subscription_plan: Optional[str] = None
+    billing_email: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class OrganizationResponse(OrganizationBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+# Project Schemas
+class ProjectBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    organization_id: int
+
+
+class ProjectCreate(ProjectBase):
+    pass
+
+
+class ProjectUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
+class ProjectResponse(ProjectBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+# Organization Role Schemas
+class OrganizationRoleBase(BaseModel):
+    user_id: int
+    organization_id: int
+    role: UserRole = UserRole.VIEWER
+
+
+class OrganizationRoleCreate(OrganizationRoleBase):
+    pass
+
+
+class OrganizationRoleUpdate(BaseModel):
+    role: Optional[UserRole] = None
+
+
+class OrganizationRoleResponse(OrganizationRoleBase):
+    id: int
+
+    class Config:
+        orm_mode = True
+
+
+# Organization Invitation Schemas
+class OrganizationInvitationBase(BaseModel):
+    email: EmailStr
+    organization_id: int
+    role: UserRole = UserRole.VIEWER
+
+
+class OrganizationInvitationCreate(OrganizationInvitationBase):
+    pass
+
+
+class OrganizationInvitationResponse(OrganizationInvitationBase):
+    id: int
+    created_at: datetime
+    accepted: bool = False
+
+    class Config:
+        orm_mode = True
 
 
 class InferenceLogBase(BaseModel):
@@ -13,6 +110,8 @@ class InferenceLogBase(BaseModel):
     latency_ms: float
     confidence: float
     output_class: str
+    organization_id: int
+    project_id: Optional[int] = None
 
 
 class InferenceLogCreate(InferenceLogBase):
@@ -31,6 +130,8 @@ class AlertThresholdBase(BaseModel):
     metric_name: Literal["latency_ms", "confidence"]
     threshold_value: float
     is_active: bool = True
+    organization_id: int
+    project_id: Optional[int] = None
 
 
 class AlertThresholdCreate(AlertThresholdBase):
@@ -90,6 +191,8 @@ class DriftMetricsBase(BaseModel):
     output_distribution_current: Optional[Dict[str, Any]] = None
     drift_severity: DriftSeverity = DriftSeverity.OK
     explanation: Optional[str] = None
+    organization_id: int
+    project_id: Optional[int] = None
 
 
 class DriftMetricsCreate(DriftMetricsBase):
@@ -118,7 +221,7 @@ class UserBase(BaseModel):
     email: EmailStr
     username: str
     full_name: Optional[str] = None
-    role: UserRole = UserRole.VIEWER
+    role: UserRole = UserRole.VIEWER  # Global role (for backward compatibility)
 
 
 class UserCreate(UserBase):
@@ -151,6 +254,7 @@ class UserResponse(UserBase):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+    organizations: Optional[List[OrganizationResponse]] = None
 
     class Config:
         orm_mode = True
@@ -164,3 +268,112 @@ class Token(BaseModel):
 class TokenData(BaseModel):
     username: Optional[str] = None
     role: Optional[UserRole] = None
+    organization_id: Optional[int] = None
+    org_role: Optional[UserRole] = None
+
+
+# Predictive Alerts Schemas
+class ForecastPoint(BaseModel):
+    timestamp: str
+    predicted_value: float
+    confidence_interval_lower: float
+    confidence_interval_upper: float
+    predicted_severity: Optional[DriftSeverity] = None
+    threshold_breach: Optional[bool] = None
+    threshold_id: Optional[int] = None
+    threshold_value: Optional[float] = None
+
+
+class DriftPrediction(BaseModel):
+    model_name: str
+    input_psi_forecast: List[ForecastPoint]
+    output_psi_forecast: List[ForecastPoint]
+    predicted_breach_time: Optional[str] = None
+    forecast_generated_at: str
+    error: Optional[str] = None
+
+
+class PerformancePrediction(BaseModel):
+    model_name: str
+    metric_type: str
+    forecast: List[ForecastPoint]
+    predicted_breach_time: Optional[str] = None
+    forecast_generated_at: str
+    error: Optional[str] = None
+
+
+class PredictiveAlert(BaseModel):
+    model_name: str
+    drift_prediction: DriftPrediction
+    latency_prediction: PerformancePrediction
+    confidence_prediction: PerformancePrediction
+    generated_at: str
+
+
+# Recommendation Schemas
+class RecommendationAction(str, Enum):
+    RETRAIN = "retrain"
+    MONITOR = "monitor"
+    INVESTIGATE = "investigate"
+    ROLLBACK = "rollback"
+    OPTIMIZE = "optimize"
+
+
+class RecommendationPriority(str, Enum):
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class Recommendation(BaseModel):
+    id: Optional[int] = None
+    model_name: str
+    action: RecommendationAction
+    priority: RecommendationPriority
+    description: str
+    reason: str
+    created_at: Optional[datetime] = None
+    is_resolved: bool = False
+    resolved_at: Optional[datetime] = None
+    organization_id: int
+    project_id: Optional[int] = None
+
+
+class RecommendationCreate(BaseModel):
+    model_name: str
+    action: RecommendationAction
+    priority: RecommendationPriority
+    description: str
+    reason: str
+    organization_id: int
+    project_id: Optional[int] = None
+
+
+class RecommendationUpdate(BaseModel):
+    is_resolved: Optional[bool] = None
+
+
+class RecommendationResponse(Recommendation):
+    class Config:
+        orm_mode = True
+
+
+# Chat Assistant Schemas
+class ChatMessage(BaseModel):
+    role: Literal["user", "assistant", "system"]
+    content: str
+    timestamp: Optional[datetime] = None
+
+
+class ChatRequest(BaseModel):
+    message: str
+    model_context: Optional[List[str]] = None
+    organization_id: Optional[int] = None
+    project_id: Optional[int] = None
+
+
+class ChatResponse(BaseModel):
+    message: str
+    context_used: Optional[Dict[str, Any]] = None
+    timestamp: datetime

@@ -14,3 +14,12 @@ python-jose==3.3.0
 passlib==1.7.4
 python-multipart==0.0.6
 bcrypt==4.0.1
+# Monitoring and logging
+prometheus-client==0.17.1
+prometheus-fastapi-instrumentator==6.1.0
+sentry-sdk[fastapi]==1.30.0
+# Intelligence layer
+xgboost==1.7.6
+openai==0.27.8
+langchain==0.0.267
+statsmodels==0.14.0
