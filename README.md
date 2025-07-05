@@ -84,34 +84,29 @@ VITE_API_URL=http://localhost:8000
 
 ## Usage
 
-### Running the Backend
+### Local Development
+
+#### Running the Backend
 
 There are multiple ways to start the FastAPI server:
 
-#### Option 1: Using the run.py script
+##### Option 1: Using the run.py script
 
 ```bash
 cd modelpulse-backend
 python run.py
 ```
 
-#### Option 2: Using uvicorn directly
+##### Option 2: Using uvicorn directly
 
 ```bash
 cd modelpulse-backend
 uvicorn app.main:app --reload
 ```
 
-#### Option 3: Using Docker Compose
-
-```bash
-cd modelpulse-backend
-docker-compose up
-```
-
 The API will be available at http://localhost:8000.
 
-### Running the Frontend
+#### Running the Frontend
 
 To start the frontend development server:
 
@@ -121,6 +116,48 @@ npm run dev
 ```
 
 The frontend will be available at http://localhost:3000.
+
+### Running with Docker Compose
+
+You can run the entire stack (frontend, backend, database, and monitoring) using Docker Compose:
+
+```bash
+docker-compose up -d
+```
+
+This will start:
+- Frontend at http://localhost:80
+- Backend API at http://localhost:8000
+- PostgreSQL database
+- Prometheus at http://localhost:9090
+- Grafana at http://localhost:3000
+- Node Exporter for host metrics
+- cAdvisor for container metrics
+
+### Production Deployment
+
+For production deployment, follow these steps:
+
+1. Update the production environment files:
+   - `modelpulse-backend/.env.production`
+   - `frontend/.env.production`
+
+2. Build and push the Docker images:
+   ```bash
+   docker-compose build
+   docker tag modelpulse-frontend:latest yourusername/modelpulse-frontend:latest
+   docker tag modelpulse-backend:latest yourusername/modelpulse-backend:latest
+   docker push yourusername/modelpulse-frontend:latest
+   docker push yourusername/modelpulse-backend:latest
+   ```
+
+3. Deploy to your chosen cloud platform:
+   - **Render**: Set up a Web Service for each component
+   - **Heroku**: Use the Heroku Container Registry
+   - **AWS ECS**: Deploy using the AWS CLI or console
+   - **Azure Web Apps**: Deploy using the Azure CLI or portal
+
+The CI/CD pipeline will automatically build, test, and deploy the application when changes are pushed to the main branch.
 
 ### API Endpoints
 
@@ -146,10 +183,47 @@ python simulator.py
 
 By default, the application uses SQLite. To use PostgreSQL or MySQL, update the database URL in `app/database.py` and `alembic.ini`.
 
+## Monitoring and Logging
+
+ModelPulse includes comprehensive monitoring and logging capabilities:
+
+### Infrastructure Monitoring
+
+- **Prometheus**: Collects metrics from the application and infrastructure
+  - Access the Prometheus UI at http://localhost:9090
+  - Configured to scrape metrics from the API, Node Exporter, and cAdvisor
+
+- **Grafana**: Visualizes metrics and provides dashboards
+  - Access Grafana at http://localhost:3000
+  - Default credentials: admin/admin
+  - Pre-configured to use Prometheus as a data source
+
+- **Node Exporter**: Collects host-level metrics (CPU, memory, disk, network)
+
+- **cAdvisor**: Collects container-level metrics
+
+### Application Monitoring
+
+- **Sentry**: Tracks and reports application errors
+  - Configure by setting the `SENTRY_DSN` in environment variables
+  - Integrated with both backend (FastAPI) and frontend (React)
+
+### Setting Up Dashboards
+
+1. Log in to Grafana at http://localhost:3000
+2. Go to Dashboards > Import
+3. Import dashboards using their IDs:
+   - Node Exporter Full: 1860
+   - Docker Containers: 893
+   - FastAPI Application: 14282
+
 ## Project Structure
 
 ```
 modelpulse/
+├── .github/                 # GitHub configuration
+│   └── workflows/           # GitHub Actions workflows
+│       └── ci-cd.yml        # CI/CD pipeline configuration
 ├── modelpulse-backend/
 │   ├── app/
 │   │   ├── __init__.py
@@ -166,7 +240,7 @@ modelpulse/
 │   ├── run.py               # Entry point script
 │   ├── start.sh             # Docker entry point
 │   ├── Dockerfile           # Docker configuration
-│   ├── docker-compose.yml   # Docker Compose configuration
+│   ├── .env.production      # Production environment variables
 │   └── requirements.txt     # Backend dependencies
 ├── frontend/
 │   ├── public/              # Static assets
@@ -178,11 +252,15 @@ modelpulse/
 │   │   ├── App.tsx          # Main application component
 │   │   ├── main.tsx         # Entry point
 │   │   └── index.css        # Global styles
-│   ├── .env                 # Environment variables
+│   ├── .env                 # Development environment variables
+│   ├── .env.production      # Production environment variables
+│   ├── Dockerfile           # Docker configuration
 │   ├── package.json         # Frontend dependencies
 │   ├── tsconfig.json        # TypeScript configuration
 │   ├── vite.config.ts       # Vite configuration
 │   └── README.md            # Frontend documentation
+├── docker-compose.yml       # Docker Compose for full stack
+├── prometheus.yml           # Prometheus configuration
 └── README.md                # This file
 ```
 
