@@ -16,7 +16,8 @@
     "react-dom": "^18.2.0",
     "react-router-dom": "^6.15.0",
     "recharts": "^2.7.3",
-    "moment": "^2.29.4"
+    "moment": "^2.29.4",
+    "@sentry/react": "^7.64.0"
   },
   "devDependencies": {
     "@types/react": "^18.2.15",
