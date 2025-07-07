@@ -29,6 +29,23 @@ from .models import (
     Recommendation,
     RecommendationAction,
     RecommendationPriority,
+    Integration,
+    IntegrationType,
+    ExportConfiguration,
+    ExportType,
+    Webhook,
+    WebhookEvent,
+    WebhookHistory,
+    AutomationPolicy,
+    AutomationPolicyType,
+    AutomationAction,
+    RetrainingJob,
+    ModelValidation,
+    ModelDeployment,
+    JobStatus,
+    ModelValidationStatus,
+    AuditLog,
+    AuditActionType,
 )
 from .drift import compute_drift_metrics, get_drift_summary
 from .predictive import (
@@ -43,6 +60,51 @@ from .recommendations import (
     generate_all_recommendations,
 )
 from .assistant import chat_with_assistant
+from .integrations import (
+    create_integration,
+    update_integration,
+    delete_integration,
+    get_integration,
+    get_integrations,
+    get_models_from_integration,
+    register_model_with_integration,
+)
+from .exporters import (
+    create_export_config,
+    update_export_config,
+    delete_export_config,
+    get_export_config,
+    get_export_configs,
+    export_logs,
+)
+from .webhooks import (
+    create_webhook,
+    update_webhook,
+    delete_webhook,
+    get_webhook,
+    get_webhooks,
+    get_webhook_history,
+    on_drift_detected,
+    on_threshold_breached,
+    on_recommendation_created,
+    on_model_registered,
+    on_retraining_started,
+    on_retraining_completed,
+    on_validation_failed,
+    on_model_deployed,
+)
+from .automation import (
+    check_policy_conditions,
+    trigger_automation_policies,
+    trigger_retraining,
+    complete_retraining_job,
+    validate_model,
+    complete_model_validation,
+    deploy_model,
+    complete_model_deployment,
+    rollback_deployment,
+    get_automl_suggestions,
+)
 from .auth import (
     create_access_token,
     get_current_user,
@@ -51,6 +113,14 @@ from .auth import (
     get_analyst_user,
     get_organization_member,
     ACCESS_TOKEN_EXPIRE_MINUTES,
+)
+from .audit import (
+    create_audit_middleware,
+    AuditLogger,
+    log_user_login,
+    log_user_logout,
+    log_config_change,
+    log_data_export,
 )
 from .schemas import (
     InferenceLogCreate,
@@ -90,6 +160,31 @@ from .schemas import (
     ChatMessage,
     ChatRequest,
     ChatResponse,
+    IntegrationCreate,
+    IntegrationUpdate,
+    IntegrationResponse,
+    ExportConfigurationCreate,
+    ExportConfigurationUpdate,
+    ExportConfigurationResponse,
+    WebhookCreate,
+    WebhookUpdate,
+    WebhookResponse,
+    WebhookHistoryResponse,
+    AutomationPolicyCreate,
+    AutomationPolicyUpdate,
+    AutomationPolicyResponse,
+    RetrainingJobCreate,
+    RetrainingJobUpdate,
+    RetrainingJobResponse,
+    ModelValidationCreate,
+    ModelValidationUpdate,
+    ModelValidationResponse,
+    ModelDeploymentCreate,
+    ModelDeploymentUpdate,
+    ModelDeploymentResponse,
+    AuditLogCreate,
+    AuditLogResponse,
+    AuditLogFilter,
 )
 from .database import get_db, engine, Base
 
@@ -117,6 +212,9 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
+# Add audit logging middleware
+app.add_middleware(create_audit_middleware())
+
 # Initialize Prometheus metrics
 instrumentator = Instrumentator().instrument(app)
 
@@ -132,7 +230,8 @@ def read_root():
 
 # Authentication Endpoints
 @app.post("/token", response_model=Token)
-def login_for_access_token(
+async def login_for_access_token(
+    request: Request,
     form_data: OAuth2PasswordRequestForm = Depends(), 
     db: Session = Depends(get_db),
     organization_id: Optional[int] = Query(None, description="Organization ID for tenant context")
@@ -144,6 +243,15 @@ def login_for_access_token(
     user = db.query(User).filter(User.username == form_data.username).first()
 
     if not user or not user.verify_password(form_data.password):
+        # Log failed login attempt
+        await log_user_login(
+            db=db,
+            user_id=user.id if user else None,
+            ip_address=request.client.host if request.client else None,
+            user_agent=request.headers.get("user-agent"),
+            status="failure"
+        )
+
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -176,6 +284,22 @@ def login_for_access_token(
         expires_delta=access_token_expires,
         organization_id=organization_id,
         org_role=org_role
+    )
+
+    # Update user's last login information
+    user.last_login = datetime.utcnow()
+    user.login_count += 1
+    user.last_ip_address = request.client.host if request.client else None
+    user.last_user_agent = request.headers.get("user-agent")
+    db.commit()
+
+    # Log successful login
+    await log_user_login(
+        db=db,
+        user_id=user.id,
+        ip_address=request.client.host if request.client else None,
+        user_agent=request.headers.get("user-agent"),
+        status="success"
     )
 
     return {"access_token": access_token, "token_type": "bearer"}
@@ -456,6 +580,18 @@ def log_inference(
                     timestamp=log.timestamp,
                 )
             )
+
+    # Trigger webhooks for threshold breaches
+    for alert in alerts:
+        on_threshold_breached(
+            db=db,
+            model_name=alert.model_name,
+            metric_name=alert.metric_name,
+            threshold_value=alert.threshold_value,
+            actual_value=alert.actual_value,
+            organization_id=current_user.current_organization_id,
+            project_id=project_id
+        )
 
     return {"log": db_log, "alerts": alerts}
 
@@ -888,9 +1024,36 @@ def compute_model_drift(
         explanation=drift_metrics_data.explanation,
     )
 
+    # Set organization and project IDs based on current user context
+    db_drift_metrics.organization_id = current_user.current_organization_id
+    db_drift_metrics.project_id = current_user.current_project_id
+
     db.add(db_drift_metrics)
     db.commit()
     db.refresh(db_drift_metrics)
+
+    # Trigger webhook if drift is detected (severity is not OK)
+    if db_drift_metrics.drift_severity != DriftSeverity.OK:
+        # Convert to dict for webhook payload
+        drift_metrics_dict = {
+            "model_name": db_drift_metrics.model_name,
+            "timestamp": db_drift_metrics.timestamp.isoformat(),
+            "input_kl_divergence": db_drift_metrics.input_kl_divergence,
+            "input_psi": db_drift_metrics.input_psi,
+            "output_kl_divergence": db_drift_metrics.output_kl_divergence,
+            "output_psi": db_drift_metrics.output_psi,
+            "drift_severity": db_drift_metrics.drift_severity,
+            "explanation": db_drift_metrics.explanation
+        }
+
+        # Trigger webhook
+        on_drift_detected(
+            db=db,
+            model_name=db_drift_metrics.model_name,
+            drift_metrics=drift_metrics_dict,
+            organization_id=db_drift_metrics.organization_id,
+            project_id=db_drift_metrics.project_id
+        )
 
     return db_drift_metrics
 
@@ -1039,6 +1202,30 @@ def generate_recommendations(
         project_id=project_id,
         days_to_analyze=days_to_analyze
     )
+
+    # Trigger webhooks for each recommendation
+    for recommendation in recommendations:
+        # Convert to dict for webhook payload
+        recommendation_dict = {
+            "id": recommendation.id,
+            "model_name": recommendation.model_name,
+            "action": recommendation.action,
+            "priority": recommendation.priority,
+            "description": recommendation.description,
+            "reason": recommendation.reason,
+            "created_at": recommendation.created_at.isoformat() if recommendation.created_at else None,
+            "organization_id": recommendation.organization_id,
+            "project_id": recommendation.project_id
+        }
+
+        # Trigger webhook
+        on_recommendation_created(
+            db=db,
+            recommendation=recommendation_dict,
+            organization_id=organization_id,
+            project_id=project_id
+        )
+
     return recommendations
 
 
@@ -1863,3 +2050,1177 @@ def get_plan_features(plan: str) -> Dict[str, Any]:
     }
 
     return plans.get(plan, plans["Basic"])
+
+
+# ============================================================================
+# Integration Endpoints
+# ============================================================================
+
+@app.get("/organizations/{organization_id}/integrations", response_model=List[IntegrationResponse], tags=["Integrations"])
+def get_organization_integrations(
+    organization_id: int,
+    project_id: Optional[int] = None,
+    integration_type: Optional[IntegrationType] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get all integrations for an organization.
+    Optionally filter by project ID or integration type.
+    """
+    return get_integrations(db, organization_id, project_id, integration_type)
+
+
+@app.get("/organizations/{organization_id}/integrations/{integration_id}", response_model=IntegrationResponse, tags=["Integrations"])
+def get_organization_integration(
+    organization_id: int,
+    integration_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get a specific integration by ID.
+    """
+    integration = get_integration(db, integration_id)
+    if integration.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Integration not found in this organization",
+        )
+    return integration
+
+
+@app.post("/organizations/{organization_id}/integrations", response_model=IntegrationResponse, tags=["Integrations"])
+def create_organization_integration(
+    organization_id: int,
+    integration: IntegrationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Create a new integration for an organization.
+    Only organization admins can create integrations.
+    """
+    if integration.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Organization ID in path must match organization ID in request body",
+        )
+
+    return create_integration(db, integration)
+
+
+@app.put("/organizations/{organization_id}/integrations/{integration_id}", response_model=IntegrationResponse, tags=["Integrations"])
+def update_organization_integration(
+    organization_id: int,
+    integration_id: int,
+    integration_update: IntegrationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Update an existing integration.
+    Only organization admins can update integrations.
+    """
+    # Check if integration exists and belongs to this organization
+    existing_integration = get_integration(db, integration_id)
+    if existing_integration.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Integration not found in this organization",
+        )
+
+    return update_integration(db, integration_id, integration_update)
+
+
+@app.delete("/organizations/{organization_id}/integrations/{integration_id}", response_model=Dict[str, bool], tags=["Integrations"])
+def delete_organization_integration(
+    organization_id: int,
+    integration_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Delete an integration.
+    Only organization admins can delete integrations.
+    """
+    # Check if integration exists and belongs to this organization
+    existing_integration = get_integration(db, integration_id)
+    if existing_integration.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Integration not found in this organization",
+        )
+
+    success = delete_integration(db, integration_id)
+    return {"success": success}
+
+
+@app.get("/organizations/{organization_id}/integrations/{integration_id}/models", response_model=List[Dict[str, Any]], tags=["Integrations"])
+def get_models_from_organization_integration(
+    organization_id: int,
+    integration_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get models from a specific integration.
+    """
+    # Check if integration exists and belongs to this organization
+    existing_integration = get_integration(db, integration_id)
+    if existing_integration.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Integration not found in this organization",
+        )
+
+    return get_models_from_integration(db, integration_id)
+
+
+@app.post("/organizations/{organization_id}/integrations/{integration_id}/register-model", response_model=Dict[str, Any], tags=["Integrations"])
+def register_model_with_organization_integration(
+    organization_id: int,
+    integration_id: int,
+    model_name: str = Query(..., description="Name of the model to register"),
+    model_version: str = Query(..., description="Version of the model to register"),
+    metadata: Dict[str, Any] = Body(..., description="Metadata for the model"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Register a model with a specific integration.
+    """
+    # Check if integration exists and belongs to this organization
+    existing_integration = get_integration(db, integration_id)
+    if existing_integration.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Integration not found in this organization",
+        )
+
+    result = register_model_with_integration(db, integration_id, model_name, model_version, metadata)
+
+    # Trigger webhook for model registered event
+    on_model_registered(db, model_name, model_version, metadata, organization_id, existing_integration.project_id)
+
+    return result
+
+
+# ============================================================================
+# Webhook Endpoints
+# ============================================================================
+
+@app.get("/organizations/{organization_id}/webhooks", response_model=List[WebhookResponse], tags=["Webhooks"])
+def get_organization_webhooks(
+    organization_id: int,
+    project_id: Optional[int] = None,
+    event: Optional[WebhookEvent] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get all webhooks for an organization.
+    Optionally filter by project ID or event type.
+    """
+    return get_webhooks(db, organization_id, project_id, event)
+
+
+@app.get("/organizations/{organization_id}/webhooks/{webhook_id}", response_model=WebhookResponse, tags=["Webhooks"])
+def get_organization_webhook(
+    organization_id: int,
+    webhook_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get a specific webhook by ID.
+    """
+    webhook = get_webhook(db, webhook_id)
+    if webhook.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Webhook not found in this organization",
+        )
+    return webhook
+
+
+@app.post("/organizations/{organization_id}/webhooks", response_model=WebhookResponse, tags=["Webhooks"])
+def create_organization_webhook(
+    organization_id: int,
+    webhook: WebhookCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Create a new webhook for an organization.
+    Only organization admins can create webhooks.
+    """
+    if webhook.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Organization ID in path must match organization ID in request body",
+        )
+
+    return create_webhook(db, webhook)
+
+
+@app.put("/organizations/{organization_id}/webhooks/{webhook_id}", response_model=WebhookResponse, tags=["Webhooks"])
+def update_organization_webhook(
+    organization_id: int,
+    webhook_id: int,
+    webhook_update: WebhookUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Update an existing webhook.
+    Only organization admins can update webhooks.
+    """
+    # Check if webhook exists and belongs to this organization
+    existing_webhook = get_webhook(db, webhook_id)
+    if existing_webhook.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Webhook not found in this organization",
+        )
+
+    return update_webhook(db, webhook_id, webhook_update)
+
+
+@app.delete("/organizations/{organization_id}/webhooks/{webhook_id}", response_model=Dict[str, bool], tags=["Webhooks"])
+def delete_organization_webhook(
+    organization_id: int,
+    webhook_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Delete a webhook.
+    Only organization admins can delete webhooks.
+    """
+    # Check if webhook exists and belongs to this organization
+    existing_webhook = get_webhook(db, webhook_id)
+    if existing_webhook.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Webhook not found in this organization",
+        )
+
+    success = delete_webhook(db, webhook_id)
+    return {"success": success}
+
+
+@app.get("/organizations/{organization_id}/webhooks/{webhook_id}/history", response_model=List[WebhookHistoryResponse], tags=["Webhooks"])
+def get_organization_webhook_history(
+    organization_id: int,
+    webhook_id: int,
+    limit: int = Query(100, description="Maximum number of history entries to return"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get history for a specific webhook.
+    """
+    # Check if webhook exists and belongs to this organization
+    existing_webhook = get_webhook(db, webhook_id)
+    if existing_webhook.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Webhook not found in this organization",
+        )
+
+    return get_webhook_history(db, webhook_id, limit)
+
+
+# ============================================================================
+# Export Configuration Endpoints
+# ============================================================================
+
+@app.get("/organizations/{organization_id}/exports", response_model=List[ExportConfigurationResponse], tags=["Exports"])
+def get_organization_exports(
+    organization_id: int,
+    project_id: Optional[int] = None,
+    export_type: Optional[ExportType] = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get all export configurations for an organization.
+    Optionally filter by project ID or export type.
+    """
+    return get_export_configs(db, organization_id, project_id, export_type)
+
+
+@app.get("/organizations/{organization_id}/exports/{export_id}", response_model=ExportConfigurationResponse, tags=["Exports"])
+def get_organization_export(
+    organization_id: int,
+    export_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get a specific export configuration by ID.
+    """
+    export_config = get_export_config(db, export_id)
+    if export_config.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export configuration not found in this organization",
+        )
+    return export_config
+
+
+@app.post("/organizations/{organization_id}/exports", response_model=ExportConfigurationResponse, tags=["Exports"])
+def create_organization_export(
+    organization_id: int,
+    export_config: ExportConfigurationCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Create a new export configuration for an organization.
+    Only organization admins can create export configurations.
+    """
+    if export_config.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Organization ID in path must match organization ID in request body",
+        )
+
+    return create_export_config(db, export_config)
+
+
+@app.put("/organizations/{organization_id}/exports/{export_id}", response_model=ExportConfigurationResponse, tags=["Exports"])
+def update_organization_export(
+    organization_id: int,
+    export_id: int,
+    export_config_update: ExportConfigurationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Update an existing export configuration.
+    Only organization admins can update export configurations.
+    """
+    # Check if export configuration exists and belongs to this organization
+    existing_export = get_export_config(db, export_id)
+    if existing_export.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export configuration not found in this organization",
+        )
+
+    return update_export_config(db, export_id, export_config_update)
+
+
+@app.delete("/organizations/{organization_id}/exports/{export_id}", response_model=Dict[str, bool], tags=["Exports"])
+def delete_organization_export(
+    organization_id: int,
+    export_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Delete an export configuration.
+    Only organization admins can delete export configurations.
+    """
+    # Check if export configuration exists and belongs to this organization
+    existing_export = get_export_config(db, export_id)
+    if existing_export.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export configuration not found in this organization",
+        )
+
+    success = delete_export_config(db, export_id)
+    return {"success": success}
+
+
+@app.post("/organizations/{organization_id}/exports/{export_id}/trigger", response_model=Dict[str, bool], tags=["Exports"])
+def trigger_organization_export(
+    organization_id: int,
+    export_id: int,
+    start_time: Optional[datetime] = Query(None, description="Start time for data to export (default: 1 hour ago)"),
+    end_time: Optional[datetime] = Query(None, description="End time for data to export (default: now)"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Trigger an export using a specific export configuration.
+    """
+    # Check if export configuration exists and belongs to this organization
+    existing_export = get_export_config(db, export_id)
+    if existing_export.organization_id != organization_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Export configuration not found in this organization",
+        )
+
+    success = export_logs(db, export_id, start_time, end_time)
+    return {"success": success}
+
+
+# Automation Policy Endpoints
+
+@app.get("/organizations/{organization_id}/automation-policies", response_model=List[AutomationPolicyResponse], tags=["Automation"])
+def get_organization_automation_policies(
+    organization_id: int,
+    project_id: Optional[int] = Query(None, description="Optional project ID to filter policies"),
+    model_name: Optional[str] = Query(None, description="Optional model name to filter policies"),
+    policy_type: Optional[AutomationPolicyType] = Query(None, description="Optional policy type to filter policies"),
+    is_active: Optional[bool] = Query(None, description="Optional filter for active/inactive policies"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get all automation policies for an organization.
+    Optionally filter by project ID, model name, policy type, or active status.
+    """
+    query = db.query(AutomationPolicy).filter(AutomationPolicy.organization_id == organization_id)
+
+    if project_id:
+        query = query.filter(AutomationPolicy.project_id == project_id)
+
+    if model_name:
+        query = query.filter(AutomationPolicy.model_name == model_name)
+
+    if policy_type:
+        query = query.filter(AutomationPolicy.policy_type == policy_type)
+
+    if is_active is not None:
+        query = query.filter(AutomationPolicy.is_active == is_active)
+
+    return query.all()
+
+
+@app.get("/organizations/{organization_id}/automation-policies/{policy_id}", response_model=AutomationPolicyResponse, tags=["Automation"])
+def get_organization_automation_policy(
+    organization_id: int,
+    policy_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get a specific automation policy by ID.
+    """
+    policy = db.query(AutomationPolicy).filter(
+        AutomationPolicy.id == policy_id,
+        AutomationPolicy.organization_id == organization_id
+    ).first()
+
+    if not policy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Automation policy not found in this organization",
+        )
+
+    return policy
+
+
+@app.post("/organizations/{organization_id}/automation-policies", response_model=AutomationPolicyResponse, tags=["Automation"])
+def create_organization_automation_policy(
+    organization_id: int,
+    policy: AutomationPolicyCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Create a new automation policy for an organization.
+    Only organization admins can create automation policies.
+    """
+    db_policy = AutomationPolicy(
+        name=policy.name,
+        description=policy.description,
+        model_name=policy.model_name,
+        policy_type=policy.policy_type,
+        conditions=policy.conditions,
+        actions=policy.actions,
+        is_active=policy.is_active,
+        organization_id=organization_id,
+        project_id=None,  # Set project ID separately if provided
+    )
+
+    db.add(db_policy)
+    db.commit()
+    db.refresh(db_policy)
+
+    return db_policy
+
+
+@app.put("/organizations/{organization_id}/automation-policies/{policy_id}", response_model=AutomationPolicyResponse, tags=["Automation"])
+def update_organization_automation_policy(
+    organization_id: int,
+    policy_id: int,
+    policy_update: AutomationPolicyUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Update an existing automation policy.
+    Only organization admins can update automation policies.
+    """
+    db_policy = db.query(AutomationPolicy).filter(
+        AutomationPolicy.id == policy_id,
+        AutomationPolicy.organization_id == organization_id
+    ).first()
+
+    if not db_policy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Automation policy not found in this organization",
+        )
+
+    update_data = policy_update.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(db_policy, key, value)
+
+    db.commit()
+    db.refresh(db_policy)
+
+    return db_policy
+
+
+@app.delete("/organizations/{organization_id}/automation-policies/{policy_id}", response_model=Dict[str, bool], tags=["Automation"])
+def delete_organization_automation_policy(
+    organization_id: int,
+    policy_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Delete an automation policy.
+    Only organization admins can delete automation policies.
+    """
+    db_policy = db.query(AutomationPolicy).filter(
+        AutomationPolicy.id == policy_id,
+        AutomationPolicy.organization_id == organization_id
+    ).first()
+
+    if not db_policy:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Automation policy not found in this organization",
+        )
+
+    db.delete(db_policy)
+    db.commit()
+
+    return {"success": True}
+
+
+@app.post("/organizations/{organization_id}/automation-policies/trigger", response_model=List[Dict[str, Any]], tags=["Automation"])
+def trigger_organization_automation_policies(
+    organization_id: int,
+    project_id: Optional[int] = Query(None, description="Optional project ID to filter policies"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Manually trigger automation policies for an organization.
+    Returns a list of triggered actions.
+    """
+    return trigger_automation_policies(db, organization_id, project_id)
+
+
+# Retraining Job Endpoints
+
+@app.get("/organizations/{organization_id}/retraining-jobs", response_model=List[RetrainingJobResponse], tags=["Automation"])
+def get_organization_retraining_jobs(
+    organization_id: int,
+    project_id: Optional[int] = Query(None, description="Optional project ID to filter jobs"),
+    model_name: Optional[str] = Query(None, description="Optional model name to filter jobs"),
+    status: Optional[JobStatus] = Query(None, description="Optional status to filter jobs"),
+    policy_id: Optional[int] = Query(None, description="Optional policy ID to filter jobs"),
+    skip: int = Query(0, description="Number of jobs to skip"),
+    limit: int = Query(100, description="Maximum number of jobs to return"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get all retraining jobs for an organization.
+    Optionally filter by project ID, model name, status, or policy ID.
+    """
+    query = db.query(RetrainingJob).filter(RetrainingJob.organization_id == organization_id)
+
+    if project_id:
+        query = query.filter(RetrainingJob.project_id == project_id)
+
+    if model_name:
+        query = query.filter(RetrainingJob.model_name == model_name)
+
+    if status:
+        query = query.filter(RetrainingJob.status == status)
+
+    if policy_id:
+        query = query.filter(RetrainingJob.policy_id == policy_id)
+
+    return query.order_by(RetrainingJob.created_at.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/organizations/{organization_id}/retraining-jobs/{job_id}", response_model=RetrainingJobResponse, tags=["Automation"])
+def get_organization_retraining_job(
+    organization_id: int,
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get a specific retraining job by ID.
+    """
+    job = db.query(RetrainingJob).filter(
+        RetrainingJob.id == job_id,
+        RetrainingJob.organization_id == organization_id
+    ).first()
+
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Retraining job not found in this organization",
+        )
+
+    return job
+
+
+@app.post("/organizations/{organization_id}/retraining-jobs", response_model=RetrainingJobResponse, tags=["Automation"])
+def create_organization_retraining_job(
+    organization_id: int,
+    job: RetrainingJobCreate,
+    project_id: Optional[int] = Query(None, description="Optional project ID for the job"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Create a new retraining job for an organization.
+    This will start the retraining process for the specified model.
+    """
+    return trigger_retraining(
+        db=db,
+        model_name=job.model_name,
+        organization_id=organization_id,
+        project_id=project_id,
+        policy_id=job.policy_id,
+        integration_id=job.integration_id,
+        training_params=job.training_params
+    )
+
+
+@app.put("/organizations/{organization_id}/retraining-jobs/{job_id}", response_model=RetrainingJobResponse, tags=["Automation"])
+def update_organization_retraining_job(
+    organization_id: int,
+    job_id: int,
+    job_update: RetrainingJobUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Update an existing retraining job.
+    This is primarily used to update the status, metrics, and logs of a job.
+    """
+    job = db.query(RetrainingJob).filter(
+        RetrainingJob.id == job_id,
+        RetrainingJob.organization_id == organization_id
+    ).first()
+
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Retraining job not found in this organization",
+        )
+
+    # If status is being updated to COMPLETED or FAILED, call complete_retraining_job
+    if job_update.status in [JobStatus.COMPLETED, JobStatus.FAILED]:
+        return complete_retraining_job(
+            db=db,
+            job_id=job_id,
+            status=job_update.status,
+            metrics=job_update.metrics,
+            logs=job_update.logs
+        )
+
+    # Otherwise, just update the job directly
+    update_data = job_update.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(job, key, value)
+
+    db.commit()
+    db.refresh(job)
+
+    return job
+
+
+@app.delete("/organizations/{organization_id}/retraining-jobs/{job_id}", response_model=Dict[str, bool], tags=["Automation"])
+def cancel_organization_retraining_job(
+    organization_id: int,
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Cancel a retraining job.
+    This will update the job status to CANCELLED.
+    """
+    job = db.query(RetrainingJob).filter(
+        RetrainingJob.id == job_id,
+        RetrainingJob.organization_id == organization_id
+    ).first()
+
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Retraining job not found in this organization",
+        )
+
+    if job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Cannot cancel job with status {job.status}",
+        )
+
+    job.status = JobStatus.CANCELLED
+    job.completed_at = datetime.utcnow()
+
+    db.commit()
+
+    return {"success": True}
+
+
+# Model Validation Endpoints
+
+@app.get("/organizations/{organization_id}/model-validations", response_model=List[ModelValidationResponse], tags=["Automation"])
+def get_organization_model_validations(
+    organization_id: int,
+    project_id: Optional[int] = Query(None, description="Optional project ID to filter validations"),
+    model_name: Optional[str] = Query(None, description="Optional model name to filter validations"),
+    status: Optional[ModelValidationStatus] = Query(None, description="Optional status to filter validations"),
+    retraining_job_id: Optional[int] = Query(None, description="Optional retraining job ID to filter validations"),
+    skip: int = Query(0, description="Number of validations to skip"),
+    limit: int = Query(100, description="Maximum number of validations to return"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get all model validations for an organization.
+    Optionally filter by project ID, model name, status, or retraining job ID.
+    """
+    query = db.query(ModelValidation).filter(ModelValidation.organization_id == organization_id)
+
+    if project_id:
+        query = query.filter(ModelValidation.project_id == project_id)
+
+    if model_name:
+        query = query.filter(ModelValidation.model_name == model_name)
+
+    if status:
+        query = query.filter(ModelValidation.status == status)
+
+    if retraining_job_id:
+        query = query.filter(ModelValidation.retraining_job_id == retraining_job_id)
+
+    return query.order_by(ModelValidation.created_at.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/organizations/{organization_id}/model-validations/{validation_id}", response_model=ModelValidationResponse, tags=["Automation"])
+def get_organization_model_validation(
+    organization_id: int,
+    validation_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get a specific model validation by ID.
+    """
+    validation = db.query(ModelValidation).filter(
+        ModelValidation.id == validation_id,
+        ModelValidation.organization_id == organization_id
+    ).first()
+
+    if not validation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model validation not found in this organization",
+        )
+
+    return validation
+
+
+@app.post("/organizations/{organization_id}/model-validations", response_model=ModelValidationResponse, tags=["Automation"])
+def create_organization_model_validation(
+    organization_id: int,
+    validation: ModelValidationCreate,
+    project_id: Optional[int] = Query(None, description="Optional project ID for the validation"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Create a new model validation for an organization.
+    This will start the validation process for the specified model version.
+    """
+    return validate_model(
+        db=db,
+        model_name=validation.model_name,
+        model_version=validation.model_version,
+        organization_id=organization_id,
+        project_id=project_id,
+        retraining_job_id=validation.retraining_job_id,
+        validation_params=validation.validation_params
+    )
+
+
+@app.put("/organizations/{organization_id}/model-validations/{validation_id}", response_model=ModelValidationResponse, tags=["Automation"])
+def update_organization_model_validation(
+    organization_id: int,
+    validation_id: int,
+    validation_update: ModelValidationUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Update an existing model validation.
+    This is primarily used to update the status, metrics, and logs of a validation.
+    """
+    validation = db.query(ModelValidation).filter(
+        ModelValidation.id == validation_id,
+        ModelValidation.organization_id == organization_id
+    ).first()
+
+    if not validation:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model validation not found in this organization",
+        )
+
+    # If status is being updated to PASSED or FAILED, call complete_model_validation
+    if validation_update.status in [ModelValidationStatus.PASSED, ModelValidationStatus.FAILED]:
+        return complete_model_validation(
+            db=db,
+            validation_id=validation_id,
+            status=validation_update.status,
+            metrics=validation_update.metrics,
+            logs=validation_update.logs
+        )
+
+    # Otherwise, just update the validation directly
+    update_data = validation_update.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(validation, key, value)
+
+    db.commit()
+    db.refresh(validation)
+
+    return validation
+
+
+# Model Deployment Endpoints
+
+@app.get("/organizations/{organization_id}/model-deployments", response_model=List[ModelDeploymentResponse], tags=["Automation"])
+def get_organization_model_deployments(
+    organization_id: int,
+    project_id: Optional[int] = Query(None, description="Optional project ID to filter deployments"),
+    model_name: Optional[str] = Query(None, description="Optional model name to filter deployments"),
+    status: Optional[JobStatus] = Query(None, description="Optional status to filter deployments"),
+    retraining_job_id: Optional[int] = Query(None, description="Optional retraining job ID to filter deployments"),
+    validation_id: Optional[int] = Query(None, description="Optional validation ID to filter deployments"),
+    integration_id: Optional[int] = Query(None, description="Optional integration ID to filter deployments"),
+    is_rollback: Optional[bool] = Query(None, description="Optional filter for rollback deployments"),
+    skip: int = Query(0, description="Number of deployments to skip"),
+    limit: int = Query(100, description="Maximum number of deployments to return"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get all model deployments for an organization.
+    Optionally filter by various parameters.
+    """
+    query = db.query(ModelDeployment).filter(ModelDeployment.organization_id == organization_id)
+
+    if project_id:
+        query = query.filter(ModelDeployment.project_id == project_id)
+
+    if model_name:
+        query = query.filter(ModelDeployment.model_name == model_name)
+
+    if status:
+        query = query.filter(ModelDeployment.status == status)
+
+    if retraining_job_id:
+        query = query.filter(ModelDeployment.retraining_job_id == retraining_job_id)
+
+    if validation_id:
+        query = query.filter(ModelDeployment.validation_id == validation_id)
+
+    if integration_id:
+        query = query.filter(ModelDeployment.integration_id == integration_id)
+
+    if is_rollback is not None:
+        query = query.filter(ModelDeployment.is_rollback == is_rollback)
+
+    return query.order_by(ModelDeployment.created_at.desc()).offset(skip).limit(limit).all()
+
+
+@app.get("/organizations/{organization_id}/model-deployments/{deployment_id}", response_model=ModelDeploymentResponse, tags=["Automation"])
+def get_organization_model_deployment(
+    organization_id: int,
+    deployment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get a specific model deployment by ID.
+    """
+    deployment = db.query(ModelDeployment).filter(
+        ModelDeployment.id == deployment_id,
+        ModelDeployment.organization_id == organization_id
+    ).first()
+
+    if not deployment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model deployment not found in this organization",
+        )
+
+    return deployment
+
+
+@app.post("/organizations/{organization_id}/model-deployments", response_model=ModelDeploymentResponse, tags=["Automation"])
+def create_organization_model_deployment(
+    organization_id: int,
+    deployment: ModelDeploymentCreate,
+    project_id: Optional[int] = Query(None, description="Optional project ID for the deployment"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Create a new model deployment for an organization.
+    This will start the deployment process for the specified model version.
+    """
+    return deploy_model(
+        db=db,
+        model_name=deployment.model_name,
+        model_version=deployment.model_version,
+        integration_id=deployment.integration_id,
+        organization_id=organization_id,
+        project_id=project_id,
+        retraining_job_id=deployment.retraining_job_id,
+        validation_id=deployment.validation_id,
+        deployment_params=deployment.deployment_params,
+        previous_deployment_id=deployment.previous_deployment_id,
+        is_rollback=deployment.is_rollback
+    )
+
+
+@app.put("/organizations/{organization_id}/model-deployments/{deployment_id}", response_model=ModelDeploymentResponse, tags=["Automation"])
+def update_organization_model_deployment(
+    organization_id: int,
+    deployment_id: int,
+    deployment_update: ModelDeploymentUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Update an existing model deployment.
+    This is primarily used to update the status, endpoint URL, and logs of a deployment.
+    """
+    deployment = db.query(ModelDeployment).filter(
+        ModelDeployment.id == deployment_id,
+        ModelDeployment.organization_id == organization_id
+    ).first()
+
+    if not deployment:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Model deployment not found in this organization",
+        )
+
+    # If status is being updated to COMPLETED or FAILED, call complete_model_deployment
+    if deployment_update.status in [JobStatus.COMPLETED, JobStatus.FAILED]:
+        return complete_model_deployment(
+            db=db,
+            deployment_id=deployment_id,
+            status=deployment_update.status,
+            endpoint_url=deployment_update.endpoint_url,
+            logs=deployment_update.logs
+        )
+
+    # Otherwise, just update the deployment directly
+    update_data = deployment_update.dict(exclude_unset=True)
+    for key, value in update_data.items():
+        setattr(deployment, key, value)
+
+    db.commit()
+    db.refresh(deployment)
+
+    return deployment
+
+
+@app.post("/organizations/{organization_id}/model-deployments/{deployment_id}/rollback", response_model=ModelDeploymentResponse, tags=["Automation"])
+def rollback_organization_model_deployment(
+    organization_id: int,
+    deployment_id: int,
+    project_id: Optional[int] = Query(None, description="Optional project ID for the rollback"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Rollback to a previous deployment.
+    This will create a new deployment that reverts to the specified deployment.
+    """
+    return rollback_deployment(
+        db=db,
+        deployment_id=deployment_id,
+        organization_id=organization_id,
+        project_id=project_id
+    )
+
+
+# AutoML Suggestions Endpoint
+
+@app.get("/organizations/{organization_id}/models/{model_name}/automl-suggestions", response_model=List[Dict[str, Any]], tags=["Automation"])
+def get_organization_automl_suggestions(
+    organization_id: int,
+    model_name: str,
+    project_id: Optional[int] = Query(None, description="Optional project ID to filter data"),
+    days_to_analyze: int = Query(30, description="Number of days of data to analyze"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_analyst_user),
+):
+    """
+    Get AutoML suggestions for a model based on historical data and performance trends.
+    """
+    return get_automl_suggestions(
+        db=db,
+        model_name=model_name,
+        organization_id=organization_id,
+        project_id=project_id,
+        days_to_analyze=days_to_analyze
+    )
+
+
+# Audit Log Endpoints
+
+@app.get("/audit-logs", response_model=List[AuditLogResponse], tags=["Compliance"])
+def get_audit_logs(
+    start_date: Optional[datetime] = Query(None, description="Filter logs from this date"),
+    end_date: Optional[datetime] = Query(None, description="Filter logs until this date"),
+    action: Optional[AuditActionType] = Query(None, description="Filter by action type"),
+    resource_type: Optional[str] = Query(None, description="Filter by resource type"),
+    resource_id: Optional[str] = Query(None, description="Filter by resource ID"),
+    user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    status: Optional[str] = Query(None, description="Filter by status (success/failure)"),
+    skip: int = Query(0, description="Skip N records"),
+    limit: int = Query(100, description="Limit to N records"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Get audit logs with optional filtering.
+    Admin users can see all logs, while other users can only see their own logs.
+    """
+    query = db.query(AuditLog)
+
+    # Apply filters
+    if start_date:
+        query = query.filter(AuditLog.timestamp >= start_date)
+    if end_date:
+        query = query.filter(AuditLog.timestamp <= end_date)
+    if action:
+        query = query.filter(AuditLog.action == action)
+    if resource_type:
+        query = query.filter(AuditLog.resource_type == resource_type)
+    if resource_id:
+        query = query.filter(AuditLog.resource_id == resource_id)
+    if user_id:
+        query = query.filter(AuditLog.user_id == user_id)
+    if status:
+        query = query.filter(AuditLog.status == status)
+
+    # Order by timestamp descending (newest first)
+    query = query.order_by(AuditLog.timestamp.desc())
+
+    # Pagination
+    logs = query.offset(skip).limit(limit).all()
+
+    return logs
+
+
+@app.get("/organizations/{organization_id}/audit-logs", response_model=List[AuditLogResponse], tags=["Compliance"])
+def get_organization_audit_logs(
+    organization_id: int,
+    start_date: Optional[datetime] = Query(None, description="Filter logs from this date"),
+    end_date: Optional[datetime] = Query(None, description="Filter logs until this date"),
+    action: Optional[AuditActionType] = Query(None, description="Filter by action type"),
+    resource_type: Optional[str] = Query(None, description="Filter by resource type"),
+    resource_id: Optional[str] = Query(None, description="Filter by resource ID"),
+    user_id: Optional[int] = Query(None, description="Filter by user ID"),
+    status: Optional[str] = Query(None, description="Filter by status (success/failure)"),
+    skip: int = Query(0, description="Skip N records"),
+    limit: int = Query(100, description="Limit to N records"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_organization_member),
+):
+    """
+    Get audit logs for a specific organization with optional filtering.
+    Organization admins can see all logs for the organization, while other users can only see their own logs.
+    """
+    query = db.query(AuditLog).filter(AuditLog.organization_id == organization_id)
+
+    # If not an admin, restrict to user's own logs
+    if current_user.get_role_in_organization(organization_id) != UserRole.ADMIN:
+        query = query.filter(AuditLog.user_id == current_user.id)
+
+    # Apply filters
+    if start_date:
+        query = query.filter(AuditLog.timestamp >= start_date)
+    if end_date:
+        query = query.filter(AuditLog.timestamp <= end_date)
+    if action:
+        query = query.filter(AuditLog.action == action)
+    if resource_type:
+        query = query.filter(AuditLog.resource_type == resource_type)
+    if resource_id:
+        query = query.filter(AuditLog.resource_id == resource_id)
+    if user_id:
+        query = query.filter(AuditLog.user_id == user_id)
+    if status:
+        query = query.filter(AuditLog.status == status)
+
+    # Order by timestamp descending (newest first)
+    query = query.order_by(AuditLog.timestamp.desc())
+
+    # Pagination
+    logs = query.offset(skip).limit(limit).all()
+
+    return logs
+
+
+@app.delete("/organizations/{organization_id}/audit-logs", status_code=status.HTTP_204_NO_CONTENT, tags=["Compliance"])
+async def purge_organization_audit_logs(
+    organization_id: int,
+    older_than_days: int = Query(..., description="Purge logs older than this many days"),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_admin_user),
+):
+    """
+    Purge audit logs for a specific organization that are older than the specified number of days.
+    This is useful for GDPR compliance and data retention policies.
+    """
+    # Calculate the cutoff date
+    cutoff_date = datetime.utcnow() - timedelta(days=older_than_days)
+
+    # Delete logs older than the cutoff date
+    db.query(AuditLog).filter(
+        AuditLog.organization_id == organization_id,
+        AuditLog.timestamp < cutoff_date
+    ).delete()
+
+    db.commit()
+
+    # Log the purge action
+    await log_data_export(
+        db=db,
+        user_id=current_user.id,
+        resource_type="audit_logs",
+        details={"action": "purge", "organization_id": organization_id, "older_than_days": older_than_days},
+        organization_id=organization_id
+    )
+
+    return
