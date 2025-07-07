@@ -1,9 +1,20 @@
-from pydantic import BaseModel, Field, EmailStr, validator
+from pydantic import BaseModel, Field, EmailStr, validator, HttpUrl
 from typing import List, Optional, Literal, Dict, Any, Union
 from datetime import datetime
 from enum import Enum
 
-from .models import UserRole, DriftSeverity
+from .models import (
+    UserRole, 
+    DriftSeverity, 
+    IntegrationType, 
+    ExportType, 
+    WebhookEvent, 
+    AutomationPolicyType, 
+    AutomationAction, 
+    ModelValidationStatus, 
+    JobStatus,
+    AuditActionType
+)
 
 
 # Organization Schemas
@@ -13,6 +24,16 @@ class OrganizationBase(BaseModel):
     subscription_plan: str = "Basic"
     billing_email: Optional[str] = None
     is_active: bool = True
+
+    # Compliance fields
+    data_retention_days: int = 365
+    pii_handling_policy: str = "encrypt"
+    data_residency_region: Optional[str] = None
+    gdpr_compliant: bool = False
+    hipaa_compliant: bool = False
+    soc2_compliant: bool = False
+    encryption_at_rest: bool = True
+    encryption_in_transit: bool = True
 
 
 class OrganizationCreate(OrganizationBase):
@@ -25,6 +46,16 @@ class OrganizationUpdate(BaseModel):
     subscription_plan: Optional[str] = None
     billing_email: Optional[str] = None
     is_active: Optional[bool] = None
+
+    # Compliance fields
+    data_retention_days: Optional[int] = None
+    pii_handling_policy: Optional[str] = None
+    data_residency_region: Optional[str] = None
+    gdpr_compliant: Optional[bool] = None
+    hipaa_compliant: Optional[bool] = None
+    soc2_compliant: Optional[bool] = None
+    encryption_at_rest: Optional[bool] = None
+    encryption_in_transit: Optional[bool] = None
 
 
 class OrganizationResponse(OrganizationBase):
@@ -223,12 +254,24 @@ class UserBase(BaseModel):
     full_name: Optional[str] = None
     role: UserRole = UserRole.VIEWER  # Global role (for backward compatibility)
 
+    # SSO fields
+    identity_provider: Optional[str] = None
+    external_id: Optional[str] = None
+
+    # MFA fields
+    mfa_enabled: bool = False
+    mfa_type: Optional[str] = None
+
 
 class UserCreate(UserBase):
-    password: str
+    password: Optional[str] = None
 
     @validator("password")
     def password_strength(cls, v):
+        # Skip validation if password is None (for SSO users)
+        if v is None:
+            return v
+
         if len(v) < 8:
             raise ValueError("Password must be at least 8 characters long")
         if not any(c.isupper() for c in v):
@@ -239,6 +282,19 @@ class UserCreate(UserBase):
             raise ValueError("Password must contain at least one digit")
         return v
 
+    @validator("password", "identity_provider")
+    def validate_auth_method(cls, v, values):
+        # Ensure either password or identity_provider is provided
+        if "identity_provider" in values and values["identity_provider"] is not None:
+            # SSO user, password can be None
+            return v
+        elif "password" in values and values["password"] is not None:
+            # Password user, identity_provider can be None
+            return v
+        else:
+            # Neither password nor identity_provider provided
+            raise ValueError("Either password or identity_provider must be provided")
+
 
 class UserUpdate(BaseModel):
     email: Optional[EmailStr] = None
@@ -248,12 +304,26 @@ class UserUpdate(BaseModel):
     role: Optional[UserRole] = None
     is_active: Optional[bool] = None
 
+    # SSO fields
+    identity_provider: Optional[str] = None
+    external_id: Optional[str] = None
+
+    # MFA fields
+    mfa_enabled: Optional[bool] = None
+    mfa_type: Optional[str] = None
+    mfa_secret: Optional[str] = None
+
 
 class UserResponse(UserBase):
     id: int
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+    # Audit fields
+    last_login: Optional[datetime] = None
+    login_count: Optional[int] = None
+
     organizations: Optional[List[OrganizationResponse]] = None
 
     class Config:
@@ -377,3 +447,293 @@ class ChatResponse(BaseModel):
     message: str
     context_used: Optional[Dict[str, Any]] = None
     timestamp: datetime
+
+
+# Integration Schemas
+class IntegrationBase(BaseModel):
+    name: str
+    integration_type: IntegrationType
+    config: Dict[str, Any]
+    is_active: bool = True
+    organization_id: int
+    project_id: Optional[int] = None
+
+
+class IntegrationCreate(IntegrationBase):
+    pass
+
+
+class IntegrationUpdate(BaseModel):
+    name: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None
+    is_active: Optional[bool] = None
+
+
+class IntegrationResponse(IntegrationBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+# Export Configuration Schemas
+class ExportConfigurationBase(BaseModel):
+    name: str
+    export_type: ExportType
+    config: Dict[str, Any]
+    schedule: Optional[str] = None
+    is_active: bool = True
+    organization_id: int
+    project_id: Optional[int] = None
+
+
+class ExportConfigurationCreate(ExportConfigurationBase):
+    pass
+
+
+class ExportConfigurationUpdate(BaseModel):
+    name: Optional[str] = None
+    config: Optional[Dict[str, Any]] = None
+    schedule: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
+class ExportConfigurationResponse(ExportConfigurationBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+# Webhook Schemas
+class WebhookBase(BaseModel):
+    name: str
+    url: HttpUrl
+    events: List[WebhookEvent]
+    headers: Optional[Dict[str, str]] = None
+    is_active: bool = True
+    organization_id: int
+    project_id: Optional[int] = None
+
+
+class WebhookCreate(WebhookBase):
+    pass
+
+
+class WebhookUpdate(BaseModel):
+    name: Optional[str] = None
+    url: Optional[HttpUrl] = None
+    events: Optional[List[WebhookEvent]] = None
+    headers: Optional[Dict[str, str]] = None
+    is_active: Optional[bool] = None
+
+
+class WebhookHistoryResponse(BaseModel):
+    id: int
+    webhook_id: int
+    event: WebhookEvent
+    payload: Dict[str, Any]
+    response_status: Optional[int] = None
+    response_body: Optional[str] = None
+    error: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+class WebhookResponse(WebhookBase):
+    id: int
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+# Automation Policy Schemas
+class AutomationPolicyBase(BaseModel):
+    name: str
+    description: Optional[str] = None
+    model_name: Optional[str] = None
+    policy_type: AutomationPolicyType
+    conditions: Dict[str, Any]
+    actions: List[Dict[str, Any]]
+    is_active: bool = True
+
+
+class AutomationPolicyCreate(AutomationPolicyBase):
+    pass
+
+
+class AutomationPolicyUpdate(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    model_name: Optional[str] = None
+    policy_type: Optional[AutomationPolicyType] = None
+    conditions: Optional[Dict[str, Any]] = None
+    actions: Optional[List[Dict[str, Any]]] = None
+    is_active: Optional[bool] = None
+
+
+class AutomationPolicyResponse(AutomationPolicyBase):
+    id: int
+    organization_id: int
+    project_id: Optional[int] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        orm_mode = True
+
+
+# Retraining Job Schemas
+class RetrainingJobBase(BaseModel):
+    model_name: str
+    training_params: Optional[Dict[str, Any]] = None
+
+
+class RetrainingJobCreate(RetrainingJobBase):
+    policy_id: Optional[int] = None
+    integration_id: Optional[int] = None
+
+
+class RetrainingJobUpdate(BaseModel):
+    status: Optional[JobStatus] = None
+    training_params: Optional[Dict[str, Any]] = None
+    metrics: Optional[Dict[str, Any]] = None
+    logs: Optional[str] = None
+
+
+class RetrainingJobResponse(RetrainingJobBase):
+    id: int
+    status: JobStatus
+    metrics: Optional[Dict[str, Any]] = None
+    logs: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    created_at: datetime
+    policy_id: Optional[int] = None
+    integration_id: Optional[int] = None
+    organization_id: int
+    project_id: Optional[int] = None
+
+    class Config:
+        orm_mode = True
+
+
+# Model Validation Schemas
+class ModelValidationBase(BaseModel):
+    model_name: str
+    model_version: str
+    validation_params: Optional[Dict[str, Any]] = None
+
+
+class ModelValidationCreate(ModelValidationBase):
+    retraining_job_id: Optional[int] = None
+
+
+class ModelValidationUpdate(BaseModel):
+    status: Optional[ModelValidationStatus] = None
+    metrics: Optional[Dict[str, Any]] = None
+    logs: Optional[str] = None
+
+
+class ModelValidationResponse(ModelValidationBase):
+    id: int
+    status: ModelValidationStatus
+    metrics: Optional[Dict[str, Any]] = None
+    logs: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    created_at: datetime
+    retraining_job_id: Optional[int] = None
+    organization_id: int
+    project_id: Optional[int] = None
+
+    class Config:
+        orm_mode = True
+
+
+# Model Deployment Schemas
+class ModelDeploymentBase(BaseModel):
+    model_name: str
+    model_version: str
+    deployment_params: Optional[Dict[str, Any]] = None
+
+
+class ModelDeploymentCreate(ModelDeploymentBase):
+    retraining_job_id: Optional[int] = None
+    validation_id: Optional[int] = None
+    integration_id: Optional[int] = None
+    previous_deployment_id: Optional[int] = None
+    is_rollback: bool = False
+
+
+class ModelDeploymentUpdate(BaseModel):
+    status: Optional[JobStatus] = None
+    deployment_params: Optional[Dict[str, Any]] = None
+    endpoint_url: Optional[str] = None
+    logs: Optional[str] = None
+
+
+class ModelDeploymentResponse(ModelDeploymentBase):
+    id: int
+    status: JobStatus
+    endpoint_url: Optional[str] = None
+    logs: Optional[str] = None
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None
+    created_at: datetime
+    retraining_job_id: Optional[int] = None
+    validation_id: Optional[int] = None
+    integration_id: Optional[int] = None
+    organization_id: int
+    project_id: Optional[int] = None
+    previous_deployment_id: Optional[int] = None
+    is_rollback: bool
+
+    class Config:
+        orm_mode = True
+
+
+# Audit Log Schemas
+class AuditLogBase(BaseModel):
+    action: AuditActionType
+    resource_type: str
+    resource_id: Optional[str] = None
+    details: Optional[Dict[str, Any]] = None
+    status: Optional[str] = None
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+
+
+class AuditLogCreate(AuditLogBase):
+    user_id: Optional[int] = None
+    organization_id: Optional[int] = None
+    project_id: Optional[int] = None
+
+
+class AuditLogResponse(AuditLogBase):
+    id: int
+    timestamp: datetime
+    user_id: Optional[int] = None
+    organization_id: Optional[int] = None
+    project_id: Optional[int] = None
+
+    class Config:
+        orm_mode = True
+
+
+class AuditLogFilter(BaseModel):
+    start_date: Optional[datetime] = None
+    end_date: Optional[datetime] = None
+    action: Optional[AuditActionType] = None
+    resource_type: Optional[str] = None
+    resource_id: Optional[str] = None
+    user_id: Optional[int] = None
+    status: Optional[str] = None

@@ -18,8 +18,54 @@ bcrypt==4.0.1
 prometheus-client==0.17.1
 prometheus-fastapi-instrumentator==6.1.0
 sentry-sdk[fastapi]==1.30.0
+loguru==0.7.0
+opentelemetry-api==1.18.0
+opentelemetry-sdk==1.18.0
+opentelemetry-exporter-otlp==1.18.0
+
+# Security and compliance
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+python-multipart==0.0.6
+pyotp==2.8.0  # For TOTP-based MFA
+qrcode==7.4.2  # For generating QR codes for MFA
+python-saml==1.15.0  # For SAML SSO
+authlib==1.2.0  # For OAuth2/OIDC SSO
+cryptography==40.0.2  # For encryption
+argon2-cffi==21.3.0  # For stronger password hashing
 # Intelligence layer
 xgboost==1.7.6
 openai==0.27.8
 langchain==0.0.267
 statsmodels==0.14.0
+
+# Integrations
+mlflow==2.8.0
+boto3==1.28.53
+google-cloud-aiplatform==1.36.0
+
+# Automation
+celery==5.3.4
+redis==5.0.1
+kfp==2.0.1
+kubeflow-training==1.7.0
+hyperopt==0.2.7
+optuna==3.3.0
+
+# Message Queues
+pika==1.3.2  # RabbitMQ client
+confluent-kafka==2.1.1  # Kafka client
+aiokafka==0.8.1  # Async Kafka client
+
+# Kubernetes and Cloud
+kubernetes==26.1.0  # Kubernetes Python client
+kopf==1.36.0  # Kubernetes Operator Framework
+pyyaml==6.0  # For YAML parsing (Kubernetes manifests)
+jinja2==3.1.2  # For templating (Helm charts)
+
+# Exporters
+elasticsearch==8.10.0
+datadog==0.47.0
+
+# Webhooks
+aiohttp==3.8.5

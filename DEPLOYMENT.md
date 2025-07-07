@@ -16,6 +16,12 @@ This document provides detailed instructions for deploying the ModelPulse applic
   - [Prometheus](#prometheus)
   - [Grafana](#grafana)
   - [Sentry](#sentry)
+- [AI-Driven Automation](#ai-driven-automation)
+  - [Automation Policies](#automation-policies)
+  - [Retraining Pipelines](#retraining-pipelines)
+  - [Model Validation](#model-validation)
+  - [Model Deployment](#model-deployment)
+  - [AutoML Suggestions](#automl-suggestions)
 - [Environment Variables](#environment-variables)
 - [Security Considerations](#security-considerations)
 - [Troubleshooting](#troubleshooting)
@@ -228,10 +234,32 @@ To configure Sentry for error tracking:
 Create `modelpulse-backend/.env.production` with:
 
 ```
+# Database
 DATABASE_URL=postgresql://username:password@host:port/database
+
+# Security
 SECRET_KEY=your-secret-key
-SENTRY_DSN=your-sentry-dsn
 CORS_ORIGINS=https://your-frontend-url.com
+
+# Monitoring
+SENTRY_DSN=your-sentry-dsn
+
+# Automation
+CELERY_BROKER_URL=redis://redis:6379/0
+CELERY_RESULT_BACKEND=redis://redis:6379/0
+ENABLE_AUTOML=true
+AUTOML_ANALYSIS_DAYS=30
+
+# ML Platforms (optional, based on your integrations)
+MLFLOW_TRACKING_URI=https://your-mlflow-server
+AWS_ACCESS_KEY_ID=your-aws-access-key
+AWS_SECRET_ACCESS_KEY=your-aws-secret-key
+AWS_REGION=us-west-2
+GOOGLE_APPLICATION_CREDENTIALS=/path/to/credentials.json
+
+# Kubeflow (optional)
+KFP_ENDPOINT=https://your-kubeflow-pipelines-endpoint
+KFP_NAMESPACE=kubeflow
 ```
 
 ### Frontend
@@ -239,8 +267,19 @@ CORS_ORIGINS=https://your-frontend-url.com
 Create `frontend/.env.production` with:
 
 ```
+# API Configuration
 VITE_API_URL=https://your-backend-url.com
+
+# Monitoring
 VITE_SENTRY_DSN=your-sentry-dsn
+
+# Feature Flags
+VITE_ENABLE_AUTOMATION=true
+VITE_ENABLE_AUTOML=true
+
+# UI Configuration
+VITE_AUTOMATION_REFRESH_INTERVAL=60000
+VITE_DEFAULT_ANALYSIS_DAYS=30
 ```
 
 ## Security Considerations
@@ -271,3 +310,27 @@ VITE_SENTRY_DSN=your-sentry-dsn
 4. **CI/CD Pipeline Failures**:
    - Check GitHub Actions logs for detailed error messages
    - Verify that all required secrets are configured correctly
+
+5. **Automation Pipeline Issues**:
+   - Check Celery worker logs: `docker-compose logs -f celery`
+   - Verify Redis connection: `redis-cli ping` should return `PONG`
+   - Ensure ML platform integrations are properly configured
+   - Check that automation policies have valid conditions and actions
+
+6. **Retraining Job Failures**:
+   - Examine job logs in the UI or via API
+   - Verify access to training data and model registry
+   - Check for sufficient resources (memory, CPU, GPU)
+   - Validate hyperparameters and training configuration
+
+7. **Model Validation Failures**:
+   - Check validation dataset accessibility
+   - Verify validation metrics and thresholds
+   - Examine validation logs for specific error messages
+   - Ensure the model version exists in the model registry
+
+8. **Deployment Issues**:
+   - Verify integration credentials and permissions
+   - Check deployment target availability and capacity
+   - Examine deployment logs for specific error messages
+   - For rollback failures, ensure the previous deployment exists and is valid
